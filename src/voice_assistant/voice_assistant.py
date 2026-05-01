@@ -13,6 +13,7 @@ from .transcriber import Transcriber
 from .synthesizer import Synthesizer
 from .llm_handler import LLMHandler
 from .audio_utils import SENTENCE_END_PUNCTUATION, monitor_memory
+from .command_executor import execute_command
 
 class VoiceAssistant:
     def __init__(self, args, client):
@@ -232,6 +233,15 @@ class VoiceAssistant:
 
             # Process any plugins
             user_text = self._process_plugins(user_text)
+
+            # Try command execution (open, search, system actions)
+            command_response = execute_command(user_text)
+            if command_response:
+                logging.info(f"Command executed: {command_response}")
+                self.tts.speak(command_response)
+                self.tts.queue.join()
+                self.audio.start()
+                return
 
             logging.info(f"You: {user_text}")
 
