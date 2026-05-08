@@ -13,7 +13,7 @@ from .transcriber import Transcriber
 from .synthesizer import Synthesizer
 from .llm_handler import LLMHandler
 from .audio_utils import SENTENCE_END_PUNCTUATION, monitor_memory
-from .command_executor import execute_command
+from .command_executor import execute_open, process_response, COMMAND_SYSTEM_PROMPT
 
 class VoiceAssistant:
     def __init__(self, args, client):
@@ -235,8 +235,9 @@ class VoiceAssistant:
             user_text = self._process_plugins(user_text)
 
             # Try command execution (open, search, system actions)
-            command_response = execute_command(user_text)
-            if command_response:
+            # First check if LLM already returned an action tag
+            command_response = process_response(user_text)
+            if command_response != user_text:
                 logging.info(f"Command executed: {command_response}")
                 self.tts.speak(command_response)
                 self.tts.queue.join()

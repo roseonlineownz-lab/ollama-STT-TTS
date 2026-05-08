@@ -34,6 +34,7 @@ from voice_assistant.voice_assistant import VoiceAssistant
 
 # Import VibeVoice synthesizer
 from voice_assistant.vibevoice_synthesizer import VibeVoiceSynthesizer
+from voice_assistant.command_executor import process_response, get_enhanced_system_prompt
 
 import threading
 import time
@@ -203,6 +204,7 @@ class NovaMasterVoiceAssistant:
                 return
 
             # Stream LLM response to TTS
+            full_response = ""
             sentence_buffer = ""
             for token in self.llm.chat_stream(user_text):
                 if token is None:
@@ -211,6 +213,7 @@ class NovaMasterVoiceAssistant:
                     self.tts.clear_queue()
                     break
 
+                full_response += token
                 sentence_buffer += token
                 if any(p in token for p in SENTENCE_END_PUNCTUATION):
                     sentence = sentence_buffer.strip()
@@ -220,6 +223,14 @@ class NovaMasterVoiceAssistant:
 
             if sentence_buffer.strip() and not self.interrupt_event.is_set():
                 self.tts.speak(sentence_buffer.strip())
+
+            # Process any [ACTION:open:X] commands in the response
+            processed = process_response(full_response)
+            if processed != full_response:
+                # Actions were executed, speak the clean response if different
+                clean = process_response(full_response)
+                if clean and clean != full_response and not any(p in full_response for p in SENTENCE_END_PUNCTUATION):
+                    self.tts.speak(clean)
 
             self.tts.queue.join()
             self.conversation_count += 1

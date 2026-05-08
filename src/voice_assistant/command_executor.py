@@ -1,203 +1,144 @@
 """
-Command Executor for NovaMaster Voice Assistant.
+NovaMaster Command Executor — Handles voice commands like "open AionUI", "start ComfyUI", etc.
+Intercepts LLM responses containing [ACTION:xxx] tags and executes them.
+"""
+import logging
+import subprocess
+import webbrowser
+import os
+import json
+import re
 
-Intercepts voice commands and executes actions (open URLs, search, control services)
-instead of just chatting. Runs BEFORE sending to LLM so common actions are instant.
+logger = logging.getLogger("nova-command")
+
+# Service registry with URLs and start commands
+SERVICES = {
+    # VPS Services
+    "aion ui": {"url": "http://72.62.237.198:25808", "type": "browser"},
+    "aionui": {"url": "http://72.62.237.198:25808", "type": "browser"},
+    "open webui": {"url": "http://72.62.237.198:3080", "type": "browser"},
+    "webui": {"url": "http://72.62.237.198:3080", "type": "browser"},
+    "hermes": {"url": "http://72.62.237.198:9119", "type": "browser"},
+    "hermes office": {"url": "http://72.62.237.198:9119", "type": "browser"},
+    "n8n": {"url": "http://72.62.237.198:5678", "type": "browser"},
+    "space agent": {"url": "http://72.62.237.198:3003", "type": "browser"},
+    "spaceagent": {"url": "http://72.62.237.198:3003", "type": "browser"},
+    "grafana": {"url": "http://72.62.237.198:3001", "type": "browser"},
+    "portainer": {"url": "http://72.62.237.198:9000", "type": "browser"},
+    "langfuse": {"url": "http://72.62.237.198:3099", "type": "browser"},
+    "uptime kuma": {"url": "http://72.62.237.198:3002/dashboard", "type": "browser"},
+    "openclaw": {"url": "http://72.62.237.198:18791", "type": "browser"},
+    "litellm": {"url": "http://72.62.237.198:4000", "type": "browser"},
+    "qdrant": {"url": "http://72.62.237.198:6333/dashboard", "type": "browser"},
+    "nova master": {"url": "http://72.62.237.198:8090", "type": "browser"},
+    "novamaster": {"url": "http://72.62.237.198:8090", "type": "browser"},
+    "ollama vps": {"url": "http://72.62.237.198:11434", "type": "browser"},
+    "jarvis vps": {"url": "http://72.62.237.198:8888", "type": "browser"},
+    # Local Services
+    "jarvis": {"url": "http://127.0.0.1:8888", "type": "browser"},
+    "jarvis cockpit": {"url": "http://127.0.0.1:8888", "type": "browser"},
+    "ollama": {"url": "http://127.0.0.1:11434", "type": "browser"},
+    "comfyui": {"url": "http://127.0.0.1:8188", "type": "browser"},
+    "comfy ui": {"url": "http://127.0.0.1:8188", "type": "browser"},
+    "vibevoice": {"url": "http://127.0.0.1:8094", "type": "browser"},
+    "clawmem": {"url": "http://127.0.0.1:7438", "type": "browser"},
+    "launcher": {"url": "file:///mnt/c/Users/roseo/OneDrive/Bureaublad/alle novamasters%20toools%20en%20launcher%202026/NovaMaster%20Launcher.html", "type": "browser"},
+    "dashboard": {"url": "file:///mnt/c/Users/roseo/OneDrive/Bureaublad/alle novamasters%20toools%20en%20launcher%202026/NovaMaster%20Launcher.html", "type": "browser"},
+    # Start commands (for services that need starting)
+    "jarvis start": {"cmd": "bash -c 'cd /home/faramix/Mark-XXX/ui_web && nohup /usr/bin/python3.12 jarvis_webui.py > /tmp/jarvis-cockpit.log 2>&1 &'", "type": "shell"},
+    "comfyui start": {"cmd": "systemctl --user start comfyui.service", "type": "shell"},
+    "ollama start": {"cmd": "sudo systemctl start ollama.service", "type": "shell"},
+}
+
+# System prompt addition for function calling
+COMMAND_SYSTEM_PROMPT = """
+You are Nova, a voice assistant that can CONTROL SERVICES. When the user asks to OPEN, START, LAUNCH, or GO TO a service, respond with:
+[ACTION:open:SERVICE_NAME]
+For example:
+- "open AionUI" → [ACTION:open:aion ui]
+- "start ComfyUI" → [ACTION:open:comfyui]  
+- "open the launcher" → [ACTION:open:launcher]
+- "check jarvis" → [ACTION:open:jarvis]
+- "open grafana" → [ACTION:open:grafana]
+- "go to n8n" → [ACTION:open:n8n]
+- "open the dashboard" → [ACTION:open:dashboard]
+
+Available services: aion ui, open webui, hermes, n8n, space agent, grafana, portainer, langfuse, uptime kuma, openclaw, litellm, qdrant, jarvis, comfyui, ollama, vibevoice, clawmem, launcher, dashboard, nova master
+
+If the user just asks a question (no action), answer normally without any [ACTION] tags.
+Keep responses SHORT — one or two sentences max for voice.
 """
 
-import logging
-import re
-import subprocess
-import sys
-import shutil
-from typing import Optional
 
-# ── Action Definitions ──────────────────────────────────────────────────────
-
-BROWSER_ACTIONS = {
-    "youtube": "https://youtube.com",
-    "google": "https://google.com",
-    "github": "https://github.com",
-    "x": "https://x.com",
-    "twitter": "https://x.com",
-    "reddit": "https://reddit.com",
-    "gmail": "https://mail.google.com",
-    "maps": "https://maps.google.com",
-    "chatgpt": "https://chat.openai.com",
-    "claude": "https://claude.ai",
-    "gemini": "https://gemini.google.com",
-}
-
-SERVICE_ACTIONS = {
-    "cockpit": "http://127.0.0.1:8888",
-    "jarvis": "http://127.0.0.1:8888",
-    "office": "http://127.0.0.1:3000",
-    "grafana": "http://127.0.0.1:3001",
-    "comfyui": "http://127.0.0.1:8188",
-    "n8n": "http://127.0.0.1:5678",
-    "open webui": "http://127.0.0.1:3080",
-    "webui": "http://127.0.0.1:3080",
-    "hermes": "http://127.0.0.1:9119",
-    "uptime kuma": "http://127.0.0.1:3002/dashboard",
-    "uptime": "http://127.0.0.1:3002/dashboard",
-    "portainer": "http://127.0.0.1:9000",
-    "qdrant": "http://127.0.0.1:6333/dashboard",
-}
-
-# Open patterns: "open youtube", "open youtube.com", "open the office"
-OPEN_RE = re.compile(
-    r"(?:open| launch| start| ga naar| go to)\s+"
-    r"(?:the\s+|mijn\s+|de\s+)?"
-    r"(.+?)$",
-    re.IGNORECASE,
-)
-
-SEARCH_RE = re.compile(
-    r"(?:search|zoek|google|zoek op)\s+(?:for|naar|op|to)?\s*(.+)",
-    re.IGNORECASE,
-)
-
-PLAY_RE = re.compile(
-    r"(?:play|speel|spelen)\s+(.+?)(?:\s+(?:on|op)\s+(.+))?$",
-    re.IGNORECASE,
-)
-
-
-def _open_url(url: str) -> bool:
-    """Open URL in Windows browser from WSL. Avoids transparent/frameless window issue."""
-    try:
-        # WSL: use cmd.exe /c start to open in Windows default browser
-        if shutil.which("cmd.exe"):
-            subprocess.run(["cmd.exe", "/c", "start", "", url], capture_output=True, timeout=5)
-            return True
-        # macOS
-        if sys.platform == "darwin":
-            subprocess.run(["open", url], capture_output=True, timeout=5)
-            return True
-        # Linux native
-        subprocess.run(["xdg-open", url], capture_output=True, timeout=5)
-        return True
-    except Exception as e:
-        logging.error(f"Failed to open URL {url}: {e}")
-        return False
-
-
-def _resolve_target(name: str) -> Optional[str]:
-    """Resolve a spoken name to a URL."""
-    name = name.strip().lower()
-    # Strip .com/.nl etc
-    clean = re.sub(r"\.(com|nl|org|io|net|app)$", "", name)
-
-    # Check browser actions first
-    for key, url in BROWSER_ACTIONS.items():
-        if key in clean or clean in key:
-            return url
-
-    # Check service actions
-    for key, url in SERVICE_ACTIONS.items():
-        if key in clean or clean in key:
-            return url
-
-    # Try as direct URL
-    if "." in clean and " " not in clean:
-        return f"https://{clean}.com"
-
+def find_service(name: str) -> dict:
+    """Find a service by name (fuzzy match)."""
+    name_lower = name.lower().strip()
+    # Exact match
+    if name_lower in SERVICES:
+        return SERVICES[name_lower]
+    # Partial match
+    for key, val in SERVICES.items():
+        if name_lower in key or key in name_lower:
+            return val
     return None
 
 
-def execute_open(text: str) -> Optional[str]:
-    """Handle 'open X' commands. Returns spoken confirmation or None."""
-    m = OPEN_RE.search(text)
-    if not m:
-        return None
-
-    target = m.group(1).strip()
-    url = _resolve_target(target)
-
+def execute_open(service_name: str) -> str:
+    """Open a service URL in the default browser."""
+    service = find_service(service_name)
+    if not service:
+        return f"Service '{service_name}' not found. Say 'launcher' to see all services."
+    
+    url = service.get("url")
     if url:
-        if _open_url(url):
-            logging.info(f"Opened browser: {url}")
-            return f"Opening {target}"
-        else:
-            return f"Sorry, could not open {target}"
-    else:
-        # Try as unknown website
-        try_url = f"https://{target.lower().replace(' ', '')}.com"
-        if _open_url(try_url):
-            logging.info(f"Opened browser: {try_url}")
-            return f"Opening {target}"
-        else:
-            return None
-
-
-def execute_search(text: str) -> Optional[str]:
-    """Handle 'search for X' commands."""
-    m = SEARCH_RE.search(text)
-    if not m:
-        return None
-
-    query = m.group(1).strip()
-    if not query:
-        return None
-
-    try:
-        encoded = query.replace(" ", "+")
-        url = f"https://google.com/search?q={encoded}"
-        _open_url(url)
-        logging.info(f"Searched Google: {query}")
-        return f"Searching for {query}"
-    except Exception as e:
-        logging.error(f"Search failed: {e}")
-        return None
-
-
-def execute_system(text: str) -> Optional[str]:
-    """Handle system commands."""
-    t = text.lower().strip()
-
-    # Volume control
-    if "volume up" in t or "harder" in t:
-        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "+10%"], capture_output=True)
-        return "Volume up"
-    if "volume down" in t or "zachter" in t:
-        subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", "-10%"], capture_output=True)
-        return "Volume down"
-    if "mute" in t or "geluid uit" in t:
-        subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1"], capture_output=True)
-        return "Muted"
-    if "unmute" in t or "geluid aan" in t:
-        subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"], capture_output=True)
-        return "Unmuted"
-
-    # Screenshot
-    if "screenshot" in t or "schermafbeelding" in t:
+        # Use cmd.exe start for WSL to open in Windows browser
         try:
-            subprocess.run(["cmd.exe", "/c", "start", "snippingtool", "/clip"], capture_output=True, timeout=3)
-        except Exception:
-            subprocess.Popen(["gnome-screenshot", "-f", "/tmp/voice_screenshot.png"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return "Taking screenshot"
-
-    return None
-
-
-COMMAND_HANDLERS = [
-    ("open", execute_open),
-    ("search", execute_search),
-    ("system", execute_system),
-]
-
-
-def execute_command(text: str) -> Optional[str]:
-    """
-    Try to execute a voice command. Returns spoken response if handled, None to fall through to LLM.
-    """
-    # Try specific handlers based on keywords
-    for handler_name, handler in COMMAND_HANDLERS:
-        try:
-            result = handler(text)
-            if result:
-                return result
+            subprocess.Popen(
+                ["cmd.exe", "/c", "start", "", url],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            return f"Opening {service_name}"
         except Exception as e:
-            logging.error(f"Handler {handler_name} failed: {e}")
+            logger.error(f"Failed to open {url}: {e}")
+            return f"Failed to open {service_name}: {e}"
+    return f"No URL for {service_name}"
 
-    return None
+
+def execute_shell(cmd: str) -> str:
+    """Execute a shell command."""
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+        return f"Done: {result.stdout[:100]}" if result.stdout else "Done"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def process_response(text: str) -> str:
+    """
+    Process LLM response, execute any [ACTION:xxx] tags, 
+    and return clean text for TTS.
+    """
+    actions = re.findall(r'\[ACTION:(\w+):([^\]]+)\]', text)
+    
+    responses = []
+    for action_type, target in actions:
+        if action_type == "open":
+            result = execute_open(target)
+            responses.append(result)
+    
+    # Remove action tags from text for TTS
+    clean_text = re.sub(r'\[ACTION:[^\]]+\]', '', text).strip()
+    
+    # If we had actions, append their results
+    if responses:
+        action_text = ". ".join(responses)
+        if clean_text:
+            return f"{clean_text}. {action_text}"
+        return action_text
+    
+    return clean_text if clean_text else text
+
+
+def get_enhanced_system_prompt() -> str:
+    """Return the enhanced system prompt with command capabilities."""
+    return COMMAND_SYSTEM_PROMPT
